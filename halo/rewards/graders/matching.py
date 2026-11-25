@@ -144,19 +144,27 @@ def exact_match(predicted: str, expected: str) -> bool:
     return normalize_text(predicted) == normalize_text(expected)
 
 
-def _stated_values(text: str) -> list[float]:
-    """Every number a normalized answer states, or none when it is an expression or a bound."""
+def _value_text(text: str) -> str | None:
+    """A normalized answer with formatting and unit exponents read away, or ``None`` for an expression or a bound."""
     text = _LATEX_GROUPING_RE.sub(",", text)
     text = _LATEX_FORMATTING_RE.sub(" ", text).translate(_CHAR_MAP)
     text = _UNIT_EXPONENT_RE.sub(" ", text)
     if _EXPRESSION_OR_BOUND_RE.search(text) or _VARIABLE_OPERAND_RE.search(text):
+        return None
+    return text
+
+
+def _stated_values(text: str) -> list[float]:
+    """Every number a normalized answer states, or none when it is an expression or a bound."""
+    value_text = _value_text(text)
+    if value_text is None:
         return []
 
     values: list[float] = []
     previous_end = None
-    for match in _NUMBER_RE.finditer(text):
+    for match in _NUMBER_RE.finditer(value_text):
         # The gap runs up to the digits, so a sign right after an operand reads as the operator it is.
-        if previous_end is not None and _OPERATOR_GAP_RE.fullmatch(text, previous_end, match.start("value")):
+        if previous_end is not None and _OPERATOR_GAP_RE.fullmatch(value_text, previous_end, match.start("value")):
             return []
         value = float(match["sign"] + match["value"].replace(",", ""))
         values.append(value / 100.0 if match["percent"] else value)
@@ -164,24 +172,40 @@ def _stated_values(text: str) -> list[float]:
     return values
 
 
+def _half_unit(text: str) -> float:
+    """Half a unit in the last place the one number a normalized answer states is written to (``3.14`` 0.005,
+    ``1.5e3`` 50, ``12.5%`` 0.0005), and 0 for a written integer, which matches only itself."""
+    match = _NUMBER_RE.search(_value_text(text) or "")
+    if match is None:
+        raise ValueError(f"{text!r} states no number; numeric_match reads a half unit only off one stated value")
+    mantissa, _, exponent = match["value"].partition("e")
+    decimals = len(mantissa.partition(".")[2])
+    if not decimals and not exponent:
+        return 0.0
+    return 0.5 * 10.0 ** (int(exponent or 0) - decimals) * (0.01 if match["percent"] else 1.0)
+
+
 def numeric_match(
     predicted: str,
     expected: str,
-    rtol: float = 0.01,
+    rtol: float | None = None,
     atol: float = 1e-6,
 ) -> bool:
     """Whether the prediction states one value equal to the expected number within tolerance. Every number in it must
     match, so a hedge (``7 or 8``), restated working, an operand or expression (``1/2``, ``10²``, ``\\sqrt{2}``,
-    ``log 2``) and a bound (``x < 3``) grade wrong. The expected answer must state exactly one value."""
-    expected_values = _stated_values(normalize_text(expected))
+    ``log 2``) and a bound (``x < 3``) grade wrong. The expected answer must state exactly one value.
+
+    Without ``rtol`` the tolerance is the precision the expected answer is written to: an integer matches only itself
+    (a flat relative band pays ``895`` for ``902``), and ``3.14`` matches what rounds to it (``3.1416``)."""
+    expected_text = normalize_text(expected)
+    expected_values = _stated_values(expected_text)
     if len(expected_values) != 1:
         return False
     target = expected_values[0]
+    tolerance = _half_unit(expected_text) if rtol is None else rtol * abs(target)
 
     values = _stated_values(normalize_text(predicted))
-    return bool(values) and all(
-        abs(value - target) <= atol or (target != 0 and abs(value - target) / abs(target) <= rtol) for value in values
-    )
+    return bool(values) and all(abs(value - target) <= max(tolerance, atol) for value in values)
 
 
 def is_correct_answer(predicted: Any, expected: Any) -> bool:

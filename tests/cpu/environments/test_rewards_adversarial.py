@@ -213,6 +213,47 @@ def test_numeric_match_rejects_expressions_and_hedges(predicted, expected):
 
 
 @pytest.mark.parametrize(
+    ("predicted", "expected"),
+    [
+        ("895", "902"),  # an AIME-range near miss, inside a flat 1% band
+        ("990", "999"),
+        ("1008", "999"),
+        ("101", "100"),
+        ("2017", "2016"),
+        ("12", "12.1"),  # a decimal holds to the place it is written to
+        ("6.95", "7"),
+        ("3.1", "3.14"),
+        ("3.14", "3.14159"),
+        ("49%", "50%"),
+        ("1.6e3", "1.5e3"),
+    ],
+)
+def test_numeric_match_rejects_a_near_miss_beyond_the_stated_precision(predicted, expected):
+    assert numeric_match(predicted, expected) is False
+    assert is_correct_answer(predicted, expected) is False
+
+
+@pytest.mark.parametrize(
+    ("predicted", "expected"),
+    [
+        ("902", "902"),
+        ("902.0", "902"),
+        ("3.1416", "3.14"),  # more digits than the expected answer states
+        ("0.5", "50%"),
+        ("1520", "1.5e3"),
+        ("1,000", "1000"),
+    ],
+)
+def test_numeric_match_accepts_a_value_that_rounds_to_the_expected_answer(predicted, expected):
+    assert numeric_match(predicted, expected) is True
+
+
+def test_numeric_match_keeps_a_caller_relative_tolerance():
+    assert numeric_match("895", "902", rtol=0.01) is True
+    assert numeric_match("880", "902", rtol=0.01) is False
+
+
+@pytest.mark.parametrize(
     ("predicted", "expected", "verdict"),
     [
         ("18", "$18", True),  # the expected answer is read like a prediction

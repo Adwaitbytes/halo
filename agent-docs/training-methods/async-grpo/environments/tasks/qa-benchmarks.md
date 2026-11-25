@@ -38,7 +38,7 @@ A sixth backend, `mock`, returns fabricated snippets and is refused unless `HALO
 Grading is all-or-nothing, 1 or 0 (`halo/rewards/graders/matching.py`), priced by the reward's `environment` term ([Reward Terms](../../../grpo/rewards/README.md#environment-arm)).
 
 1. `exact_match` — case-insensitive, after normalization.
-2. `numeric_match` — every number in the response against the one value the expected answer states (`$18` and `18 dollars` expect 18). Tolerance `rtol=0.01` / `atol=1e-6`; percentages are divided by 100, and `3,500` or `10\,000` read as one number.
+2. `numeric_match` — every number in the response against the one value the expected answer states (`$18` and `18 dollars` expect 18). Tolerance is the precision the expected answer is written to: a written integer matches only itself (`895` grades wrong for `902`), a decimal matches what rounds to it (`3.1416` for `3.14`), and an exponent sets the place (`1.5e3` holds to 50); an explicit `rtol` replaces that with a relative band, and `atol=1e-6` absorbs float noise; percentages are divided by 100, and `3,500` or `10\,000` read as one number.
 
 There is no fuzzy or substring matcher: "7" must not match "17".
 
