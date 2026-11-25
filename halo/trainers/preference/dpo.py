@@ -17,10 +17,17 @@ from collections.abc import Callable
 
 import torch
 import torch.nn.functional as F
+from datasets import Dataset
 from trl import DPOTrainer
+from trl.data_utils import is_conversational
 
 from halo.data.completion_spans import completion_labels
+from halo.data.pipeline.coordinated_map import coordinated_filter, coordinated_map, resolve_map_num_proc
+from halo.data.pipeline.preferences import tokenize_preference_row
+from halo.data.turn_markers import resolve_eos_token_ids
 from halo.kernels.logprobs import LABEL_IGNORE_INDEX, sequence_logprobs
+from halo.model_loading.tokenizer_setup import resolve_tokenizer
+from halo.trainers.construction.ctor_slots import get_ctor_arg
 from halo.trainers.distributed_trainer import DistributedTrainerMixin
 from halo.trainers.parallelism.pipeline_loss_adapter import (
     PipelineLossAdapter,
@@ -40,6 +47,13 @@ from halo.trainers.preference.preference_rules import reject_dpo_pp_objective
 from halo.trainers.preference.trl_preference import TRLPreferenceMixin
 from halo.trainers.trl_dataset_prep import TRLDatasetPrepMixin
 
+# The preference tokenizer's columns, renamed to the ones TRL's DPO collator reads.
+_TRL_TOKEN_COLUMNS = {
+    "prompt_input_ids": "prompt_ids",
+    "chosen_input_ids": "chosen_ids",
+    "rejected_input_ids": "rejected_ids",
+}
+
 
 def _ipo_pair_loss(
     beta: float, chosen_scores: torch.Tensor, rejected_scores: torch.Tensor, labels: torch.Tensor
@@ -49,6 +63,10 @@ def _ipo_pair_loss(
     chosen_counts, rejected_counts = split_pairs(counts)
     ipo_delta = chosen_scores / chosen_counts - rejected_scores / rejected_counts
     return (ipo_delta - 1 / (2 * beta)) ** 2
+
+
+def _prompt_leaves_room(row: dict, max_length: int) -> bool:
+    return len(row["prompt_ids"]) < max_length
 
 
 # ``(beta, chosen_scores, rejected_scores, labels) -> per-pair loss``, shared by the PP gate and the
@@ -72,6 +90,51 @@ class DistributedDPOTrainer(TRLPreferenceMixin, DistributedTrainerMixin, TRLData
         "aux loss and skips the family's head transform. Liger kernels are still applied at the model "
         "level by load_distributed_model."
     )
+
+    def __init__(self, *args, **kwargs):
+        # TRL tokenizes inside its constructor, before ``self.model`` exists, and the model config is where Gemma 4
+        # lists the ``<turn|>`` that closes its turns.
+        model = get_ctor_arg(args, kwargs, "model", self.CTOR_POSITIONS)
+        self._turn_end_configs = (getattr(model, "config", None), getattr(model, "generation_config", None))
+        super().__init__(*args, **kwargs)
+
+    def _prepare_dataset(self, dataset, processing_class, args, dataset_name):
+        """Templated string rows tokenize as SMPO's do, each completion closed by the turn's own terminator: TRL's
+        string path appends ``eos_token`` to any completion whose text does not end with it, a second terminator after
+        ``<|im_end|>\\n`` or Gemma 4's ``<turn|>\\n``. Message rows and iterable datasets keep TRL's path."""
+        if not isinstance(dataset, Dataset) or is_conversational(dataset[0]):
+            return super()._prepare_dataset(dataset, processing_class, args, dataset_name)
+        if "prompt" not in dataset.column_names:
+            raise ValueError(
+                f"DPO dataset '{dataset_name}' holds text rows without a 'prompt' column, so the completions cannot "
+                "be split off. Pass message rows, or text rows with an explicit 'prompt'."
+            )
+        tokenizer = resolve_tokenizer(processing_class)
+        num_proc = resolve_map_num_proc(args.dataset_num_proc)
+        dataset = coordinated_map(
+            dataset,
+            tokenize_preference_row,
+            num_proc=num_proc,
+            desc=f"Tokenizing {dataset_name} dataset",
+            # The collator cuts each sequence to ``max_length``, so no budget applies here.
+            fn_kwargs={
+                "processing_class": tokenizer,
+                "max_prompt_length": None,
+                "max_completion_length": None,
+                "truncation_mode": args.truncation_mode,
+                "eos_token_ids": resolve_eos_token_ids(tokenizer, *self._turn_end_configs),
+            },
+        ).rename_columns(_TRL_TOKEN_COLUMNS)
+        if args.max_length is None or args.truncation_mode != "keep_start":
+            return dataset
+        # As TRL drops them: under ``keep_start`` such a prompt leaves the collator no completion token to train.
+        return coordinated_filter(
+            dataset,
+            _prompt_leaves_room,
+            desc=f"Dropping fully truncated {dataset_name} rows",
+            num_proc=num_proc,
+            fn_kwargs={"max_length": args.max_length},
+        )
 
     def _reject_unsupported_pp_options(self, kwargs: dict) -> None:
         """Ctor parameters are read from ``kwargs`` only, since a positional argument would rebind TRL's ``model``
