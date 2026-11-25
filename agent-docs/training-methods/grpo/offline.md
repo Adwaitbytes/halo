@@ -69,11 +69,11 @@ Rewards map to advantages per group at preprocessing, then clip to `[-10, 10]`.
 
 ### Loss types
 
-All three weight each example by `1/group_size`, so every group counts equally.
+All three weight each example by `1/group_size`, so every group counts equally, and divide by one denominator over every row of the optimizer step: all accumulation micro-batches on every data-parallel rank. The objective does not depend on how `per_device_train_batch_size`, `gradient_accumulation_steps` and the data-parallel ranks split the step's rows; an evaluation batch normalizes over its own rows.
 
-- `bnpo` (default): global token average over the micro-batch's group-weighted token sum.
-- `grpo`: per-sequence average, then a weighted mean across groups. Use when completion length varies.
-- `dr_grpo`: divides by effective group count × `max_completion_length`, a constant that removes length bias; a `null` cap raises at init.
+- `bnpo` (default): global token average over the step's group-weighted token sum.
+- `grpo`: per-sequence average, then a weighted mean across the step's groups. Use when completion length varies.
+- `dr_grpo`: divides by the step's effective group count × `max_completion_length`, a constant that removes length bias; a `null` cap raises at init.
 
 ### Row positions
 

@@ -103,6 +103,8 @@ def _stub(*, beta, loss_type, pg, min_log_prob, policy, reference) -> types.Simp
         "_pp_batch_transform",
         "_record_sign_metrics",
         "_pp_normalizer",
+        "_pp_step_normalizer",
+        "_mean_over_gradient_replicas",
         "_pp_token_loss",
     ):
         setattr(me, name, types.MethodType(getattr(OfflineGRPOTrainer, name), me))

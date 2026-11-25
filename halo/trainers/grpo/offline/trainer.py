@@ -10,8 +10,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Offline GRPO over stored completions and rewards. Full fine-tuning scores raw run-start reference log-probs once and
-checkpoints them; CP owns token shards of the same rows, and PP's microbatch numerators share the whole-batch
-denominators."""
+checkpoints them; CP owns token shards of the same rows, and every micro-batch divides by its share of the optimizer
+step's denominator."""
 
 import logging
 from collections.abc import Callable
@@ -19,6 +19,7 @@ from typing import Any, Union
 
 import datasets
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from peft import PeftConfig
 from torch import nn
@@ -49,8 +50,8 @@ from halo.model_loading.parallel.frozen_models import place_and_freeze
 from halo.model_loading.parallel.peft_setup import peft_bf16_autocast, prepare_policy_model
 from halo.model_loading.parallel.whole_model import resolve_trainer_model
 from halo.models.introspection.context_window import is_bounded_length
-from halo.runtime.collectives import all_gather_cat
-from halo.runtime.ranks import is_global_main_process
+from halo.runtime.collectives import all_gather_cat, collective_device
+from halo.runtime.ranks import is_global_main_process, is_multi_rank_run
 from halo.trainers.construction.training_args_overrides import keep_all_dataset_columns
 from halo.trainers.distributed_trainer import DistributedTrainerMixin
 from halo.trainers.full_logits_memory import LogitsWidth
@@ -61,6 +62,7 @@ from halo.trainers.grpo.objective.offline_loss import (
     PG_FORMULATIONS,
     clamp_negative_advantage_logps,
     offline_loss,
+    offline_loss_normalizer,
     offline_token_objective,
 )
 from halo.trainers.grpo.offline.group_rows import tokenize_offline_splits
@@ -99,7 +101,7 @@ class OfflineGRPOTrainer(
     PP_REFUSAL = None
     SUPPORTS_CP = True
     POLICY_GRADIENT_LOSS = True
-    # The objective divides by its own loss-type denominator, so the parent's grad-accum scaling stands.
+    # Each micro-batch divides by its share of the step's denominator, so the parent's grad-accum division stands.
     LOSS_IS_OWN_MEAN = True
 
     # Buffered per-sample key → logged sign prefixes (unclamped: negative side only, where it binds).
@@ -304,16 +306,48 @@ class OfflineGRPOTrainer(
             return None
         return LogitsWidth(self.max_completion_length + 1, "max_completion_length")
 
+    def _get_num_items_in_batch(self, batch_samples: list, device: torch.device) -> torch.Tensor | None:
+        """COLLECTIVE over the ranks the step averages gradients across. Each micro-batch's share of the loss
+        denominator: the normalizer over every row of the optimizer step, divided by the ranks and micro-batches whose
+        losses the step averages, so every group keeps its ``1/group_size`` share however the rows split. ``None``
+        under PP, whose runner divides by :meth:`_pp_step_normalizer`."""
+        if self._pp_runner is not None or not batch_samples:
+            return None
+        step_normalizer = offline_loss_normalizer(
+            torch.cat([self._row_loss_token_counts(batch).to(device) for batch in batch_samples]),
+            torch.cat([batch["group_size"].to(device) for batch in batch_samples]),
+            loss_type=self.loss_type,
+            max_completion_length=self.max_completion_length,
+        )
+        return self._mean_over_gradient_replicas(step_normalizer) / len(batch_samples)
+
+    def _row_loss_token_counts(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
+        """Each row's supervised-token count, as the loss counts it: from the full-row labels every CP rank holds."""
+        if self.parallelism_config.is_cp_mode:
+            return loss_token_counts_per_row(batch["labels"]).float()
+        return batch["completion_attention_mask"].sum(dim=1, dtype=torch.float32)
+
+    def _mean_over_gradient_replicas(self, value: torch.Tensor) -> torch.Tensor:
+        """COLLECTIVE over the PP stage, else the world: the ranks whose gradients the step averages. Their mean of
+        ``value``; ``value`` itself on one rank. TP and CP replicas hold equal values, so it is also the mean over the
+        step's distinct batches."""
+        if not is_multi_rank_run():
+            return value
+        total = value.to(collective_device(self._pp_stage_group))
+        dist.all_reduce(total, group=self._pp_stage_group)
+        return (total / self.parallelism_config.stage_world_size).to(value.device)
+
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         if return_outputs:
             raise ValueError("OfflineGRPOTrainer does not support returning outputs")
 
         with peft_bf16_autocast(self._peft_has_been_casted_to_bf16, self.accelerator.device):
-            return self._compute_loss_inner(model, inputs)
+            return self._compute_loss_inner(model, inputs, num_items_in_batch)
 
-    def _compute_loss_inner(self, model, inputs):
+    def _compute_loss_inner(self, model, inputs, normalizer=None):
+        """``normalizer`` is the train loop's share of the step's denominator; evaluation batches normalize alone."""
         if self.parallelism_config.is_cp_mode:
-            return self._compute_cp_loss_inner(model, inputs)
+            return self._compute_cp_loss_inner(model, inputs, normalizer)
         input_ids, attention_mask, logits_to_keep = self._joined_rows(inputs)
         completion_mask = inputs["completion_attention_mask"]
         advantages = inputs["advantage"]  # [B], pre-computed at tokenization (no gather needed)
@@ -338,12 +372,13 @@ class OfflineGRPOTrainer(
             inputs["group_size"],
             loss_type=self.loss_type,
             max_completion_length=self.max_completion_length,
+            normalizer=normalizer,
         )
 
         self._record_sign_metrics(sample_values, advantages, completion_mask)
         return loss
 
-    def _compute_cp_loss_inner(self, model, inputs):
+    def _compute_cp_loss_inner(self, model, inputs, normalizer=None):
         """Reduce only each logical row's token sums. The scorer shifts the target at every shard boundary; reference
         values are stored at the target-token positions in that same full-row grid."""
         ids, attention_mask, labels = inputs["input_ids"], inputs["attention_mask"], inputs["labels"]
@@ -375,6 +410,7 @@ class OfflineGRPOTrainer(
             max_completion_length=self.max_completion_length,
             row_token_counts=loss_token_counts_per_row(labels),
             cp_config=self.cp_config,
+            normalizer=normalizer,
         )
         self._record_sign_metrics(sample_values, advantages, supervised)
         return loss

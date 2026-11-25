@@ -1,4 +1,4 @@
-"""The offline-GRPO objective, pure tensor math. The reduction splits because the pipeline divides once per step:
+"""The offline-GRPO objective, pure tensor math. The reduction splits because one denominator spans the optimizer step:
 :func:`offline_loss_numerator` is row-local, :func:`offline_loss_normalizer` reads batch metadata alone."""
 
 from __future__ import annotations
@@ -114,12 +114,16 @@ def offline_loss(
     max_completion_length: int | None,
     row_token_counts: torch.Tensor | None = None,
     cp_config: CPConfig | None = None,
+    normalizer: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """A CP token shard passes each row's complete ``row_token_counts``."""
+    """A CP token shard passes each row's complete ``row_token_counts``. ``normalizer`` is this micro-batch's share of
+    the optimizer step's denominator; without it these rows normalize alone."""
     counts = _complete_row_token_counts(supervised_mask, row_token_counts, cp_config)
     numerator = offline_loss_numerator(
         per_token_loss, supervised_mask, group_sizes, loss_type=loss_type, row_token_counts=counts, cp_config=cp_config
     )
-    return numerator / offline_loss_normalizer(
-        counts, group_sizes, loss_type=loss_type, max_completion_length=max_completion_length
-    )
+    if normalizer is None:
+        normalizer = offline_loss_normalizer(
+            counts, group_sizes, loss_type=loss_type, max_completion_length=max_completion_length
+        )
+    return numerator / normalizer

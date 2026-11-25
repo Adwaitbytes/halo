@@ -12,7 +12,8 @@ from halo.trainers.parallelism.pipeline_loss_adapter import PipelineLossAdapter,
 
 
 class OfflineGRPOPipelineMixin:
-    """Over the host's ``_joined_rows``, ``_token_objective``, ``_live_min_log_prob`` and ``_record_sign_metrics``.
+    """Over the host's ``_joined_rows``, ``_token_objective``, ``_live_min_log_prob``, ``_record_sign_metrics`` and
+    ``_mean_over_gradient_replicas``.
     Mixed in ahead of the spine's pipeline mixin, whose ``_configure_pipeline_parallel`` builds the adapter once."""
 
     # Non-None only while the PP reference sweep drives the schedule: the last stage's loss stashes
@@ -21,14 +22,15 @@ class OfflineGRPOPipelineMixin:
 
     def _pp_loss_adapter(self) -> PipelineLossAdapter:
         """Every denominator reads batch metadata alone, so the microbatch numerators share the runner's one per-step
-        normalizer. At ``kl_beta != 0`` the reference log-probs ship as a third side tensor."""
+        normalizer; an evaluation batch normalizes alone. At ``kl_beta != 0`` the reference log-probs ship as a third
+        side tensor."""
         extra_target_keys = ("advantage", "group_size")
         if self.beta != 0.0:
             extra_target_keys += (REF_PER_TOKEN_LOGPS_COLUMN,)
         return PipelineLossAdapter(
             token_loss_fn=self._pp_token_loss,
             batch_transform=self._pp_batch_transform,
-            normalizer=self._pp_normalizer,
+            normalizer=self._pp_step_normalizer,
             extra_target_keys=extra_target_keys,
             # Row filler for partial eval batches: with 0, an inert row's 1/group_size is inf → NaN.
             pad_spec={"group_size": 1},
@@ -95,6 +97,11 @@ class OfflineGRPOPipelineMixin:
             loss_type=self.loss_type,
             max_completion_length=self.max_completion_length,
         )
+
+    def _pp_step_normalizer(self, inputs: dict[str, torch.Tensor]) -> torch.Tensor:
+        """COLLECTIVE over the stage group. This replica's share of the step's normalizer over every stage replica's
+        rows, since FSDP averages the replicas' gradients."""
+        return self._mean_over_gradient_replicas(self._pp_normalizer(inputs))
 
     def _pp_score_reference_batch(self, batch) -> list[torch.Tensor]:
         frozen_rows = self.args.per_device_train_batch_size

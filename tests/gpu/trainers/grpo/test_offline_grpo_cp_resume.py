@@ -212,7 +212,7 @@ def _record_training_rows(trainer):
     rows = []
     original = trainer._compute_loss_inner
 
-    def observed(model, inputs):
+    def observed(model, inputs, normalizer=None):
         if model.training:
             ids = (
                 inputs["input_ids"]
@@ -220,7 +220,7 @@ def _record_training_rows(trainer):
                 else torch.cat([inputs["prompt_input_ids"], inputs["completion_input_ids"]], dim=1)
             )
             rows.append(ids.detach().cpu().clone())
-        return original(model, inputs)
+        return original(model, inputs, normalizer)
 
     trainer._compute_loss_inner = observed
     return rows
